@@ -1,0 +1,622 @@
+try:
+    import xgboost
+except ImportError:
+    print("Installing xgboost...")
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "xgboost", "-q"])
+
+try:
+    import shap
+except ImportError:
+    print("Installing shap...")
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "shap", "-q"])
+
+# --- Import all necessary libraries ---
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.optimize import curve_fit
+from scipy.special import logsumexp
+from sklearn.model_selection import GridSearchCV, GroupShuffleSplit
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+import xgboost as xgb
+import statsmodels.api as sm
+from itertools import combinations
+import shap
+import contextlib
+import string
+import os
+
+# --- Create a directory for all exported files ---
+output_dir = 'manuscript_outputs'
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# --- Define the professional plotting style ---
+@contextlib.contextmanager
+def publication_style_bw_minimalist():
+    """Context manager for creating clean, B&W, minimalist plots."""
+    params = {
+        'font.family': 'serif',
+        'axes.facecolor': 'white',
+        'figure.facecolor': 'white',
+        'axes.labelsize': 14,
+        'axes.titlesize': 16,
+        'axes.edgecolor': 'black',
+        'axes.linewidth': 1.0,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
+        'xtick.direction': 'in',
+        'ytick.direction': 'in',
+        'xtick.top': True,
+        'ytick.right': True,
+        'legend.fontsize': 11,
+        'legend.frameon': False,
+        'grid.alpha': 0.0,
+    }
+    with plt.rc_context(params):
+        yield
+
+# ==============================================================================
+# DATA PREPARATION
+# ==============================================================================
+
+def prepare_data(file_path='Data_v1.xlsx'):
+    """
+    Loads data from a specific Excel sheet and returns the raw DataFrame
+    without averaging duplicates.
+    """
+    print("\n--- Running Data Preparation ---")
+
+    sheet_to_load = 'Sheet1'
+    header_row_index = 0
+
+    try:
+        df_raw = pd.read_excel(file_path, sheet_name=sheet_to_load, header=header_row_index)
+        print(f"Successfully loaded sheet '{sheet_to_load}' from '{file_path}'.")
+        print("Columns found:", df_raw.columns.tolist())
+    except Exception as e:
+        print(f"Error loading the specified sheet: {e}")
+        return None
+
+    # --- MODIFICATION: Use the raw data directly ---
+    df_clean = df_raw
+    print(f"Using raw data without averaging. The dataset has {len(df_clean)} rows.")
+    
+    print("\n--- Data Preparation Complete ---")
+    return df_clean
+
+
+# --- Execute Data Preparation ---
+df_clean = prepare_data()
+
+if df_clean is not None:
+    print("\nPreview of the raw data being used for modeling:")
+    print(df_clean.head())
+
+    # --- Export the raw DataFrame to an Excel file ---
+    output_filename = os.path.join(output_dir, 'raw_data_for_modeling.xlsx')
+    df_clean.to_excel(output_filename, index=False, sheet_name='Raw_Data')
+    print(f"\n Raw data for modeling successfully exported to '{output_filename}'.")
+
+
+# ==============================================================================
+# TWO-STEP (PRIMARY) MODELING
+# ==============================================================================
+
+# --- Step 1: Define Helper Functions & Models ---
+def calculate_all_metrics(y_true, y_pred, k, n):
+    """Calculates all required performance metrics."""
+    residuals = y_pred - y_true
+    rss = np.sum(residuals**2)
+    metrics = {
+        'RMSE': np.sqrt(rss / n),
+        'R2': r2_score(y_true, y_pred),
+        'Bf': 10**(np.mean(residuals)),
+        'Af': 10**(np.mean(np.abs(residuals))),
+        'AIC': n * np.log(rss / n) + 2 * k if rss > 0 else np.inf,
+    }
+    return metrics
+
+def weibull_log10_fixedN0(t, delta, p, logN0):
+    return logN0 - (t / np.maximum(delta, 1e-12)) ** np.maximum(p, 1e-12)
+
+def biphasic_log10_fixedN0(t, k1, k2, f, logN0):
+    f = np.clip(f, 1e-9, 1 - 1e-9)
+    k1, k2 = np.maximum(k1, 1e-12), np.maximum(k2, 1e-12)
+    A, B = np.log(f) - k1 * t, np.log(1.0 - f) - k2 * t
+    return logN0 + (logsumexp(np.vstack([A, B]), axis=0) / np.log(10.0))
+
+def geeraerd_tail_log10_fixedN0(t, k, Nres_counts, logN0):
+    k, N0_counts = np.maximum(k, 1e-12), 10.0**logN0
+    Nres_counts = np.clip(Nres_counts, 0.0, N0_counts)
+    return np.log10(Nres_counts + (N0_counts - Nres_counts) * np.exp(-k * t))
+
+def fit_weibull(t, y, logN0):
+    p0 = [max(np.median(t[t > 0]), 1e-2), 1.0]
+    popt, _ = curve_fit(lambda tt, d, p: weibull_log10_fixedN0(tt, d, p, logN0), t, y, p0=p0, bounds=([1e-6] * 2, [np.inf] * 2), maxfev=20000)
+    return ("delta", "p"), popt, 3
+
+def fit_biphasic(t, y, logN0):
+    popt, _ = curve_fit(lambda tt, k1, k2, f: biphasic_log10_fixedN0(tt, k1, k2, f, logN0), t, y, p0=[0.5, 0.05, 0.95], bounds=([1e-6] * 3, [np.inf, np.inf, 1 - 1e-6]), maxfev=50000)
+    k1, k2, f = popt
+    if k2 > k1: k1, k2, f = k2, k1, 1.0 - f
+    return ("k1", "k2", "f"), np.array([k1, k2, f]), 4
+
+def fit_tail(t, y, logN0):
+    N0_counts = 10.0**logN0
+    popt, _ = curve_fit(lambda tt, k, Nres: geeraerd_tail_log10_fixedN0(tt, k, Nres, logN0), t, y, p0=[0.2, 0.01 * N0_counts], bounds=([1e-6, 0.0], [np.inf, N0_counts]), maxfev=50000)
+    return ("k", "Nres_counts"), popt, 3
+
+# --- Step 2: Main Loop with Plotting and Metrics Calculation ---
+results_list_primary = []
+model_linestyles = ['-', '--', ':']
+fitters = [("Weibull", fit_weibull, weibull_log10_fixedN0),
+           ("Biphasic", fit_biphasic, biphasic_log10_fixedN0),
+           ("Geeraerd Tail", fit_tail, geeraerd_tail_log10_fixedN0)]
+
+print("\n--- Running Two-Step (Primary) Modeling with Minimalist Figures ---")
+if 'df_clean' in locals() and df_clean is not None:
+    for run_id in df_clean['Run-ID'].unique():
+        run = df_clean[df_clean['Run-ID'] == run_id].sort_values('Time h')
+        t, y = run['Time h'].values, run['LogN'].values
+        logN0 = float(np.nanmax(y))
+        
+        with publication_style_bw_minimalist():
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.plot(t, y, marker='o', linestyle='None', color='black', markerfacecolor='black', markersize=6, label='Observed Data')
+
+            for i, (name, fitter, model_func) in enumerate(fitters):
+                try:
+                    param_names, popt, k = fitter(t, y, logN0)
+                    yhat = model_func(t, *popt, logN0)
+                    
+                    metrics = calculate_all_metrics(y, yhat, k, len(y))
+                    res = {"Run-ID": run_id, "Model": name, **metrics, **run.iloc[0][['Oregano %', 'NaCl %', 'pH', 'Temp °C']].to_dict()}
+                    res.update(dict(zip(param_names, popt)))
+                    results_list_primary.append(res)
+
+                    t_smooth = np.linspace(t.min(), t.max(), 200)
+                    y_smooth = model_func(t_smooth, *popt, logN0)
+                    ax.plot(t_smooth, y_smooth, label=name, color='black', linestyle=model_linestyles[i], linewidth=1.5)
+                except Exception as e:
+                    print(f"[Run {run_id}] Could not fit {name}: {e}")
+            
+            ax.set_xlabel('Time (hours)'); ax.set_ylabel('Viable count (log cfu/g)')
+            ax.legend(loc='upper right')
+            
+            fig_filename = os.path.join(output_dir, f'primary_fit_run_{run_id}.png')
+            plt.savefig(fig_filename, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+# --- Step 3: Export Comparative Table and Identify Best Model ---
+if results_list_primary:
+    df_results_primary = pd.DataFrame(results_list_primary).round(4)
+    metrics_filename = os.path.join(output_dir, 'primary_model_metrics.xlsx')
+    df_results_primary.to_excel(metrics_filename, index=False, sheet_name='Model_Metrics')
+    print(f"\n--- Primary Model Metrics Exported to '{metrics_filename}' ---")
+
+    df_ranks = df_results_primary.copy()
+    df_ranks['Rank_RMSE'] = df_ranks.groupby('Run-ID')['RMSE'].rank(ascending=True)
+    df_ranks['Rank_AIC'] = df_ranks.groupby('Run-ID')['AIC'].rank(ascending=True)
+    df_ranks['Total_Rank'] = df_ranks[['Rank_RMSE', 'Rank_AIC']].sum(axis=1)
+
+    best_model_counts = df_ranks.loc[df_ranks.groupby('Run-ID')['Total_Rank'].idxmin()]['Model'].value_counts()
+    best_model_name = best_model_counts.idxmax()
+    
+    print("\n--- Determining Best Overall Primary Model via Ranking ---")
+    print("Best model counts (based on lowest combined rank of RMSE, AIC):")
+    print(best_model_counts)
+    print(f"\n The best overall primary model is: '{best_model_name}'")
+
+
+# ==============================================================================
+# CELL 4: SECONDARY MODELING (BACKWARD STEPWISE REGRESSION)
+# ==============================================================================
+
+print("\n--- Running Secondary Modeling (Parameter Regression) ---")
+
+if 'df_results_primary' in locals() and not df_results_primary.empty:
+    env_factors = ["Oregano %", "NaCl %", "pH", "Temp °C"]
+    df_primary_reg = df_results_primary.copy()
+    for a, b in combinations(env_factors, 2):
+        df_primary_reg[f"{a}*{b}"] = df_primary_reg[a] * df_primary_reg[b]
+
+    def backward_stepwise(df, y_var, x_vars, alpha=0.05):
+        X = sm.add_constant(df[x_vars])
+        y = df[y_var]
+        model = sm.OLS(y, X).fit()
+        while True:
+            pvals = model.pvalues.drop('const', errors='ignore')
+            if pvals.empty: break
+            worst_p = pvals.max()
+            if worst_p > alpha:
+                worst_var = pvals.idxmax()
+                x_vars.remove(worst_var)
+                X = sm.add_constant(df[x_vars])
+                model = sm.OLS(y, X).fit()
+            else:
+                break
+        return model, x_vars
+
+    results_secondary = []
+    predictors_full = env_factors + [f"{a}*{b}" for a, b in combinations(env_factors, 2)]
+    param_cols_to_exclude = ["Run-ID", "Model", "RMSE", "AIC", "R2", "Bf", "Af"] + env_factors
+
+    for model_name, g in df_primary_reg.groupby("Model"):
+        param_cols = [c for c in g.columns if c not in param_cols_to_exclude and '*' not in c]
+        for param in param_cols:
+            df_sub = g.dropna(subset=[param])
+            if len(df_sub) < len(predictors_full) + 2:
+                print(f"  {model_name}-{param}: skipping regression, not enough data points.")
+                continue
+            try:
+                model, kept_vars = backward_stepwise(df_sub, param, predictors_full.copy(), alpha=0.05)
+                eq = f"{param} = {model.params.get('const', 0):+.3f} " + " ".join([f"{coef:+.3f}*[{v}]" for v, coef in model.params.items() if v != 'const'])
+                results_secondary.append({
+                    "Model": model_name, "Parameter": param, "Equation": eq,
+                    "Adj_R2": model.rsquared_adj, "RMSE": np.sqrt(model.mse_resid),
+                    "AIC": model.aic, "Predictors": ", ".join(kept_vars)
+                })
+            except Exception as e:
+                print(f" {model_name}-{param}: regression failed ({e})")
+
+    if results_secondary:
+        df_secondary = pd.DataFrame(results_secondary)
+        output_secondary = os.path.join(output_dir, "secondary_model_regressions.xlsx")
+        df_secondary.to_excel(output_secondary, index=False)
+        print(f"\n Secondary regression results exported to {output_secondary}")
+
+
+# ==============================================================================
+# ONE-STEP (GLOBAL) MODELING
+# ==============================================================================
+
+if 'df_clean' in locals() and df_clean is not None:
+    logN0_global = float(np.nanmax(df_clean['LogN']))
+    
+    def global_weibull(X, d0, d_o, d_a, d_p, d_t, p0, p_o, p_a, p_p, p_t):
+        t, oeo, nacl, ph, temp = X
+        delta = d0 + d_o*oeo + d_a*nacl + d_p*ph + d_t*temp
+        p = p0 + p_o*oeo + p_a*nacl + p_p*ph + p_t*temp
+        return logN0_global - (t / np.maximum(delta, 1e-9))**np.maximum(p, 1e-9)
+
+    def global_biphasic(X, k1_0, k1_o, k1_a, k1_p, k1_t, k2_0, k2_o, k2_a, k2_p, k2_t, f0, f_o, f_a, f_p, f_t):
+        t, oeo, nacl, ph, temp = X
+        k1 = k1_0 + k1_o*oeo + k1_a*nacl + k1_p*ph + k1_t*temp
+        k2 = k2_0 + k2_o*oeo + k2_a*nacl + k2_p*ph + k2_t*temp
+        f = np.clip(f0 + f_o*oeo + f_a*nacl + f_p*ph + f_t*temp, 1e-9, 1.0 - 1e-9)
+        return logN0_global + np.log10(f * np.exp(-k1 * t) + (1 - f) * np.exp(-k2 * t))
+
+    def global_geeraerd_tail(X, k0, k_o, k_a, k_p, k_t, Nr0, Nr_o, Nr_a, Nr_p, Nr_t):
+        t, oeo, nacl, ph, temp = X; N0 = 10**logN0_global
+        k_max = k0 + k_o*oeo + k_a*nacl + k_p*ph + k_t*temp
+        log_Nres = Nr0 + Nr_o*oeo + Nr_a*nacl + Nr_p*ph + Nr_t*temp
+        Nres = np.clip(10**log_Nres, 0.0, N0)
+        return np.log10((N0 - Nres) * np.exp(-np.maximum(k_max, 1e-12) * t) + Nres)
+
+    env_factors = ['Oregano %', 'NaCl %', 'pH', 'Temp °C']
+    global_models = {
+        "Weibull": {"func": global_weibull, "p0": np.zeros(10), "k": 10, "params": [("delta", 5), ("p", 5)]},
+        "Biphasic": {"func": global_biphasic, "p0": np.zeros(15), "k": 15, "params": [("k1", 5), ("k2", 5), ("f", 5)]},
+        "Geeraerd Tail": {"func": global_geeraerd_tail, "p0": np.zeros(10), "k": 10, "params": [("k_max", 5), ("log_Nres", 5)]}
+    }
+    X_global = df_clean[['Time h'] + env_factors].values.T
+    y_global = df_clean['LogN'].values
+    n_points = len(y_global)
+    global_results = {}
+
+    for name, model_info in global_models.items():
+        print(f"\n--- Fitting Global {name} Model ---")
+        try:
+            popt, _ = curve_fit(model_info["func"], X_global, y_global, p0=model_info["p0"], maxfev=50000)
+            y_pred = model_info["func"](X_global, *popt)
+            metrics = calculate_all_metrics(y_global, y_pred, model_info["k"], n_points)
+            global_results[name] = {"y_pred": y_pred, "popt": popt, **metrics}
+        except Exception as e:
+            print(f"Could not fit global {name} model. Error: {e}")
+            global_results[name] = {"y_pred": None, "popt": None, "RMSE": np.nan, "R2": np.nan, "Bf": np.nan, "Af": np.nan, "AIC": np.nan}
+
+    # Geeraerd excluded from reporting due to poor parameter identifiability (Section 3.2)
+    reported_global_models = {k: v for k, v in global_models.items() if k != "Geeraerd Tail"}
+    reported_global_results = {k: v for k, v in global_results.items() if k != "Geeraerd Tail"}
+
+    with publication_style_bw_minimalist():
+        fig, axes = plt.subplots(1, len(reported_global_results), figsize=(12, 5.5), sharey=True)
+        line_range = np.array([-1, 8])
+
+        for i, (name, results) in enumerate(reported_global_results.items()):
+            ax = axes[i]
+            if results['y_pred'] is not None:
+                ax.plot(results['y_pred'], y_global, 'o', color='black', markersize=4, alpha=0.6)
+                ax.plot(line_range, line_range, color='black', linestyle='-', linewidth=1.5, label='y=x')
+                ax.plot(line_range + 0.5, line_range, color='red', linestyle='--', linewidth=1.5, label='APZ')
+                ax.plot(line_range - 1.0, line_range, color='red', linestyle='--', linewidth=1.5)
+                ax.set_title(f'{name}\n(AIC={results["AIC"]:.1f})')
+            else:
+                ax.set_title(f'{name}\n(Fit Failed)')
+            ax.set_xlabel('Predicted log CFU/g'); ax.set_xlim(-0.5, 7.5); ax.set_ylim(-0.5, 7.5)
+            if i == 0: ax.legend()
+        axes[0].set_ylabel('Observed log CFU/g')
+
+        fig_filename = os.path.join(output_dir, 'global_models_parity_plots_with_APZ.png')
+        plt.tight_layout(); plt.savefig(fig_filename, dpi=300, bbox_inches='tight')
+        plt.show()
+
+    equations_filename = os.path.join(output_dir, 'global_model_equations.txt')
+    with open(equations_filename, 'w') as f:
+        f.write("SECONDARY MODEL EQUATIONS FROM ONE-STEP GLOBAL FIT\n" + "="*60 + "\n")
+        for name, results in global_results.items():
+            f.write(f"\n--- Equations for Global {name} Model ---\n")
+            if results['popt'] is not None:
+                model_info, popt, param_idx = global_models[name], results['popt'], 0
+                for param_name, num_coeffs in model_info['params']:
+                    intercept, coeffs = popt[param_idx], popt[param_idx+1:param_idx+num_coeffs]
+                    equation = f"{param_name} = {intercept:+.4f} " + " ".join([f"{'-' if c < 0 else '+'} {abs(c):.4f}*[{fac}]" for fac, c in zip(env_factors, coeffs)])
+                    f.write(f"\n{equation}\n")
+                    param_idx += num_coeffs
+            else:
+                f.write("Fit failed, cannot generate equations.\n")
+    print(f"\n---  Global model equations exported to '{equations_filename}' ---")
+
+
+# ==============================================================================
+# MACHINE LEARNING MODELING & FEATURE IMPORTANCE
+# ==============================================================================
+
+if 'df_clean' in locals() and df_clean is not None:
+    print("\n--- Performing Group-Based (by Run-ID) Train-Test Split for ML Models ---")
+    features = ['Time h', 'Oregano %', 'NaCl %', 'pH', 'Temp °C']
+    target = 'LogN'
+    X, y = df_clean[features], df_clean[target]
+    groups = df_clean['Run-ID']
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
+    train_idx, test_idx = next(gss.split(X, y, groups=groups))
+
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx].copy()
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+    X_test['Run-ID'] = df_clean.loc[X_test.index, 'Run-ID']
+
+    print(f"Split data into {len(X_train)} rows for training and {len(X_test)} rows for testing.")
+    print(f"Training Run-IDs: {sorted(groups.iloc[train_idx].unique())}")
+    print(f"Testing Run-IDs:  {sorted(groups.iloc[test_idx].unique())}")
+
+    print("\n--- Starting Hyperparameter Tuning for ML Models ---")
+    grid_search_rf = GridSearchCV(RandomForestRegressor(random_state=42), {'n_estimators':[100,200],'max_depth':[10,20]}, cv=5, n_jobs=-1).fit(X_train, y_train)
+    best_rf = grid_search_rf.best_estimator_
+    
+    grid_search_xgb = GridSearchCV(xgb.XGBRegressor(objective='reg:squarederror', random_state=42), {'n_estimators':[100,200],'max_depth':[3,5]}, cv=5, n_jobs=-1).fit(X_train, y_train)
+    best_xgb = grid_search_xgb.best_estimator_
+
+    ml_results = {}
+    best_models = {'Tuned Random Forest': best_rf, 'Tuned XGBoost': best_xgb}
+    
+    for name, model in best_models.items():
+        y_pred = model.predict(X_test.drop('Run-ID', axis=1))
+        ml_results[name] = {**calculate_all_metrics(y_test, y_pred, 1, len(y_test)), 'y_pred': y_pred}
+
+    df_ml_results = pd.DataFrame(ml_results).T.sort_values('RMSE')
+    ml_metrics_filename = os.path.join(output_dir, 'ml_model_performance_metrics.xlsx')
+    df_ml_results[['RMSE','R2','Bf','Af']].round(4).to_excel(ml_metrics_filename)
+    print(f"\n---  ML Metrics Exported to '{ml_metrics_filename}' ---")
+    print(df_ml_results[['RMSE','R2','Bf','Af']].round(4))
+    
+    print("\n--- Generating ML Model Comparison Parity Plot ---")
+    with publication_style_bw_minimalist():
+        models_to_plot = ['Tuned Random Forest', 'Tuned XGBoost']
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+        panel_labels = iter(string.ascii_lowercase)
+        line_range = np.array([0, 7])
+
+        for i, model_name in enumerate(models_to_plot):
+            if model_name not in ml_results:
+                print(f"Warning: Model '{model_name}' not in results. Skipping plot.")
+                continue
+
+            ax = axes[i]
+            results = ml_results[model_name]
+            y_pred = results['y_pred']
+            rmse = results['RMSE']
+            
+            ax.plot(y_pred, y_test, 'o', color='0.3', markersize=5, alpha=0.8)
+            identity_line, = ax.plot(line_range, line_range, color='black', linestyle='-', linewidth=2, label='y=x')
+            apz_upper_line, = ax.plot(line_range, line_range + 0.5, color='red', linestyle='--', linewidth=2, label='APZ')
+            ax.plot(line_range, line_range - 1.0, color='red', linestyle='--', linewidth=2)
+            ax.set_title(f'{model_name}\n(RMSE={rmse:.2f})')
+            ax.set_xlabel('Predicted viable counts (log cfu/g)')
+            ax.set_xlim(line_range); ax.set_ylim(line_range)
+            ax.text(0.05, 0.95, f"({next(panel_labels)})", transform=ax.transAxes, fontsize=16, fontweight='bold', va='top')
+
+        axes[0].set_ylabel('Observed viable counts (log cfu/g)')
+        axes[0].legend(handles=[identity_line, apz_upper_line], labels=['y=x', 'APZ'])
+        plt.tight_layout()
+        fig_filename = os.path.join(output_dir, 'ml_models_parity_plot_comparison.png')
+        plt.savefig(fig_filename, dpi=300, bbox_inches='tight')
+        plt.show()
+
+    print("\n--- Generating Time-Series Scatter Comparison Plots ---")
+    if 'global_weibull' in locals() and 'Weibull' in global_results:
+        popt_weibull = global_results['Weibull']['popt']
+        y_pred_weibull = global_weibull(X_test.drop('Run-ID', axis=1).values.T, *popt_weibull)
+        
+        y_pred_rf = ml_results['Tuned Random Forest']['y_pred']
+        y_pred_xgb = ml_results['Tuned XGBoost']['y_pred']
+
+        plot_df = X_test.copy()
+        plot_df['Observed'] = y_test
+        plot_df['Weibull'] = y_pred_weibull
+        plot_df['Tuned Random Forest'] = y_pred_rf
+        plot_df['Tuned XGBoost'] = y_pred_xgb
+
+        run_ids_to_plot = [] 
+
+        all_test_run_ids = plot_df['Run-ID'].unique()
+        
+        if not run_ids_to_plot:
+            num_to_plot = min(len(all_test_run_ids), 4)
+            if num_to_plot > 0:
+                run_ids_to_plot = all_test_run_ids[:num_to_plot]
+                print(f"No specific Run-IDs selected. Defaulting to the first {num_to_plot} available Run-IDs in the test set: {run_ids_to_plot}")
+            else:
+                print("No Run-IDs found in the test set to plot.")
+
+        for run_id in run_ids_to_plot:
+            if run_id not in all_test_run_ids:
+                print(f"Warning: Run-ID {run_id} is not in the test set. Skipping.")
+                continue
+
+            run_data = plot_df[plot_df['Run-ID'] == run_id].sort_values('Time h')
+            
+            with publication_style_bw_minimalist():
+                fig, ax = plt.subplots(figsize=(8, 6))
+
+                ax.plot(run_data['Time h'], run_data['Observed'], 
+                        marker='o', color='grey', markersize=8, linestyle='None', label='Observed')
+                ax.plot(run_data['Time h'], run_data['Tuned Random Forest'], 
+                        marker='^', color='black', markersize=8, linestyle='None', markerfacecolor='none', label='Tuned Random Forest')
+                ax.plot(run_data['Time h'], run_data['Tuned XGBoost'],
+                        marker='D', color='black', markersize=7, linestyle='None', markerfacecolor='none', label='Tuned XGBoost')
+                ax.plot(run_data['Time h'], run_data['Weibull'],
+                        marker='s', color='black', markersize=8, linestyle='None', label='Weibull')
+
+                ax.set_xlabel('Time (hours)')
+                ax.set_ylabel('Viable counts (log cfu/g)')
+                ax.legend()
+                ax.set_title(f'Model Comparison for Run-ID: {run_id}')
+                
+                fig_filename = os.path.join(output_dir, f'scatter_comparison_run_{run_id}.png')
+                plt.savefig(fig_filename, dpi=300, bbox_inches='tight')
+                plt.show()
+    else:
+        print("Could not generate scatter comparison plots. Global Weibull model results not found.")
+
+    best_ml_model_name = df_ml_results.index[0]
+    if best_ml_model_name in best_models:
+        print(f"\n--- Generating Feature Importance for the Best Model: {best_ml_model_name} ---")
+        best_ml_model = best_models[best_ml_model_name]
+        with publication_style_bw_minimalist():
+            fig, ax = plt.subplots(figsize=(10, 7))
+            feature_imp_df = pd.DataFrame({'Feature': X_train.columns, 'Importance': best_ml_model.feature_importances_}).sort_values('Importance', ascending=False)
+            sns.barplot(x='Importance', y='Feature', data=feature_imp_df, color='lightgrey', edgecolor='black', ax=ax)
+            ax.set_title(f'Feature Importance for {best_ml_model_name}'); ax.set_xlabel('Relative Importance')
+            plt.tight_layout(); plt.savefig(os.path.join(output_dir, 'best_ml_model_feature_importance.png'), dpi=300); plt.show()
+            
+            print(f"\n--- Generating SHAP Dependency Plots for {best_ml_model_name} ---")
+            explainer = shap.TreeExplainer(best_ml_model, X_train)
+            shap_values = explainer.shap_values(X_train)
+            
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            axes = axes.flatten()
+            panel_labels = ['(a)', '(b)', '(c)', '(d)', '(e)']
+
+            for i, feature in enumerate(features):
+                ax = axes[i]
+                shap.dependence_plot(feature, shap_values, X_train, ax=ax, show=False, dot_size=20)
+                
+                ax.text(0.05, 0.95, panel_labels[i], 
+                        transform=ax.transAxes, 
+                        fontsize=20, 
+                        fontweight='bold', 
+                        ha='left', 
+                        va='top',
+                        color='black')
+
+            axes[-1].set_visible(False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'shap_dependency_plots.png'), dpi=300)
+            plt.show()
+
+
+# ==============================================================================
+# MODEL VALIDATION
+# ==============================================================================
+
+APZ_UPPER = 0.5
+APZ_LOWER = -1.0
+
+try:
+    validation_df = pd.read_excel('validation_data.xlsx')
+    features = ['Time h', 'Oregano %', 'NaCl %', 'pH', 'Temp °C'] 
+    X_val = validation_df[features]
+    y_val = validation_df['LogN']
+    print("\n Validation data loaded and prepared for prediction.")
+except FileNotFoundError:
+    print("\n ERROR: 'validation_data.xlsx' not found. Please ensure the file is in the correct directory.")
+    X_val, y_val = None, None
+
+if X_val is not None:
+    best_classical_name = pd.DataFrame(reported_global_results).T.sort_values('AIC').index[0]
+    best_ml_name = df_ml_results.index[0]
+    
+    popt_classical = global_results[best_classical_name]['popt']
+    func_classical = global_models[best_classical_name]['func']
+    
+    y_pred_classical = func_classical(X_val.values.T, *popt_classical)
+    y_pred_ml = best_models[best_ml_name].predict(X_val)
+
+    def calculate_papz(observed, predicted):
+        residuals = observed - predicted
+        count_in_zone = np.sum((residuals >= APZ_LOWER) & (residuals <= APZ_UPPER))
+        return (count_in_zone / len(observed)) * 100
+
+    papz_classical = calculate_papz(y_val, y_pred_classical)
+    papz_ml = calculate_papz(y_val, y_pred_ml)
+
+    validation_metrics = {
+        best_classical_name: calculate_all_metrics(y_val, y_pred_classical, k=len(popt_classical), n=len(y_val)),
+        best_ml_name: calculate_all_metrics(y_val, y_pred_ml, k=1, n=len(y_val))
+    }
+    
+    df_validation_summary = pd.DataFrame(validation_metrics).T
+    df_validation_summary['pAPZ (%)'] = [papz_classical, papz_ml]
+    
+    print("\n--- Validation Performance on Real Food Data ---")
+    print(df_validation_summary[['RMSE', 'R2', 'Bf', 'Af', 'pAPZ (%)']].round(3))
+
+    with publication_style_bw_minimalist():
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True, dpi=100)
+        
+        all_vals = np.concatenate([y_val, y_pred_classical, y_pred_ml])
+        min_lim = np.floor(all_vals.min()) - 1
+        max_lim = np.ceil(all_vals.max()) + 1
+        line_range = np.linspace(min_lim, max_lim, 100)
+
+        model_preds = [y_pred_classical, y_pred_ml]
+        model_names = [best_classical_name, best_ml_name]
+
+        for ax, y_pred, title in zip(axes, model_preds, model_names):
+            ax.plot(line_range, line_range, color='black', linestyle='-', linewidth=1.5, label='Identity (y=x)', zorder=2)
+            
+            ax.fill_between(line_range, line_range + APZ_LOWER, line_range + APZ_UPPER, 
+                            color='lightgrey', alpha=0.5, label=f'APZ ({APZ_LOWER}/+{APZ_UPPER})', zorder=1)
+            
+            residuals = y_val - y_pred
+            sd_res = np.std(residuals)
+            ax.plot(line_range, line_range + (1.96 * sd_res), color='grey', linestyle='--', linewidth=1, label='95% CI', zorder=2)
+            ax.plot(line_range, line_range - (1.96 * sd_res), color='grey', linestyle='--', linewidth=1, zorder=2)
+
+            ax.scatter(y_pred, y_val, color='black', edgecolor='white', s=80, alpha=0.8, zorder=3, label='Validation Data')
+            
+            ax.set_title(f'{title}\n(pAPZ: {calculate_papz(y_val, y_pred):.1f}%)', fontsize=12, fontweight='bold')
+            ax.set_xlabel('Predicted log CFU/g')
+            ax.set_xlim(min_lim, max_lim)
+            ax.set_ylim(min_lim, max_lim)
+            ax.set_aspect('equal')
+
+        axes[0].set_ylabel('Observed log CFU/g')
+        axes[0].legend(loc='upper left', fontsize='small', frameon=True)
+
+        plt.tight_layout()
+        
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        plt.savefig(os.path.join(output_dir, 'model_validation_asymmetric_APZ.png'), dpi=300, bbox_inches='tight')
+        plt.show()
